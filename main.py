@@ -1,5 +1,4 @@
 import os
-import aiohttp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langchain_groq import ChatGroq
@@ -11,8 +10,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 import json
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
 import logging
 import asyncio
 from threading import Thread
@@ -222,7 +219,7 @@ async def analyze_ticker(ticker: str, url: str = None):
         
         llm = ChatGroq(
             temperature=0, 
-            groq_api_key="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", 
+            groq_api_key="gsk_HwlqnlfpfjiSoVtwTLqZWGdyb3FYXAexK27bN", 
             model_name="deepseek-r1-distill-qwen-32b"
         )
         
@@ -279,86 +276,135 @@ async def analyze_ticker(ticker: str, url: str = None):
         raise
 
 async def analyze_news_sentiment(ticker: str):
-    """Analyze news sentiment for a company based on ticker using a news API"""
+    """Analyze news sentiment for a company based on ticker"""
     try:
-        # NewsAPI approach
-        news_api_key = "5a2495c1-272e-43c5-a49b-910c8f3bfc26"
-        url = (
-            f"https://newsapi.org/v2/everything?"
-            f"q={ticker}+OR+{ticker.split('.')[0]}+stock&"  # Include both ticker and company name
-            f"language=en&"
-            f"sortBy=relevancy&"
-            f"apiKey={news_api_key}&"
-            f"pageSize=5&"
-            f"domains=bloomberg.com,reuters.com,marketwatch.com,finance.yahoo.com"
+        url = f"https://finance.yahoo.com/quote/{ticker}/news"
+        
+        loader = WebBaseLoader(url)
+        documents = loader.load()
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
         )
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                data = await response.json()
+        splits = text_splitter.split_documents(documents)
+        
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        
+        vectorstore = FAISS.from_documents(splits, embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+        
+        llm = ChatGroq(
+            temperature=0, 
+            groq_api_key="gsk_HwlqnlfpfjiSoVtwTLqZWGdyb3FYN96gjfXAexK27bN", 
+            model_name="deepseek-r1-distill-qwen-32b"
+        )
+        
+        prompt = ChatPromptTemplate.from_template("""
+        You are a financial news analyst reviewing news articles about ticker {ticker}.
+        Based on the following information, analyze the sentiment of recent news coverage.
+        
+        Context information:
+        {context}
+        
+        For each significant news article, provide:
+        1. The title of the article
+        2. A URL (if available)
+        3. A summary of key points
+        4. An overall sentiment label (positive, negative, or neutral)
+        
+        Extract information for the 3 most important recent news items.
+        """)
+        
+        from langchain.chains.combine_documents import create_stuff_documents_chain
+        from langchain.chains import create_retrieval_chain
+        
+        document_chain = create_stuff_documents_chain(llm, prompt)
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
+        
+        response = retrieval_chain.invoke({"input": f"Analyze recent news sentiment for {ticker}", "ticker": ticker})
+        
+        try:
+            result_text = response["answer"]
+            
+            news_items = []
+            
+            lines = result_text.split("\n")
+            current_item = {}
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if line.startswith("Title:") or line.startswith("1.") or "Title" in line:
+            
+                    if current_item and "title" in current_item:
+                        news_items.append(NewsSentiment(
+                            title=current_item.get("title", "Unknown"),
+                            url=current_item.get("url", ""),
+                            summary=current_item.get("summary", "No summary available"),
+                            overall_sentiment_label=current_item.get("sentiment", "neutral")
+                        ))
+                    current_item = {"title": line.split(":", 1)[1].strip() if ":" in line else line.split(".", 1)[1].strip()}
                 
-        news_items = []
-        if data.get("status") == "ok" and data.get("articles"):
-            for article in data.get("articles")[:3]:
-                title = article.get("title", "Unknown")
-                url = article.get("url", "")
-                summary = article.get("description", "No summary available")
+                elif line.startswith("URL:") or "URL" in line or "http" in line:
+                    current_item["url"] = line.split(":", 1)[1].strip() if ":" in line else line
                 
-                # Use LLM to analyze sentiment
-                llm = ChatGroq(
-                    temperature=0,
-                    groq_api_key="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",
-                    model_name="deepseek-r1-distill-qwen-32b"
-                )
+                elif line.startswith("Summary:") or "Summary" in line:
+                    current_item["summary"] = line.split(":", 1)[1].strip() if ":" in line else line
                 
-                sentiment_prompt = f"""
-                Analyze the sentiment of this news about {ticker} stock:
-                Title: {title}
-                Summary: {summary}
-                
-                Reply with just one word: 'positive', 'negative', or 'neutral'.
-                """
-                
-                sentiment_response = await llm.ainvoke(sentiment_prompt)
-                sentiment = sentiment_response.content.strip().lower()
-                
-                if sentiment not in ["positive", "negative", "neutral"]:
-                    sentiment = "neutral"
-                
+                elif "sentiment" in line.lower() or "positive" in line.lower() or "negative" in line.lower() or "neutral" in line.lower():
+                    if "positive" in line.lower():
+                        current_item["sentiment"] = "positive"
+                    elif "negative" in line.lower():
+                        current_item["sentiment"] = "negative"
+                    else:
+                        current_item["sentiment"] = "neutral"
+            
+            if current_item and "title" in current_item:
                 news_items.append(NewsSentiment(
-                    title=title,
-                    url=url,
-                    summary=summary,
-                    overall_sentiment_label=sentiment
+                    title=current_item.get("title", "Unknown"),
+                    url=current_item.get("url", ""),
+                    summary=current_item.get("summary", "No summary available"),
+                    overall_sentiment_label=current_item.get("sentiment", "neutral")
                 ))
+            
+            if not news_items:
+                news_items = [
+                    NewsSentiment(
+                        title=f"{ticker} News Summary",
+                        url=url,
+                        summary=result_text,
+                        overall_sentiment_label="neutral"
+                    )
+                ]
                 
             return news_items
-        else:
+                
+        except Exception as e:
+            logger.error(f"Error parsing news sentiment: {str(e)}")
             return [
                 NewsSentiment(
-                    title=f"{ticker} Recent Performance",
-                    url=f"https://finance.yahoo.com/quote/{ticker}",
-                    summary=f"Visit Yahoo Finance for the latest updates on {ticker}.",
+                    title=f"{ticker} News Analysis",
+                    url=url,
+                    summary=response["answer"],
                     overall_sentiment_label="neutral"
                 )
             ]
-                
+    
     except Exception as e:
         logger.error(f"Error analyzing news sentiment: {str(e)}")
-        return [
-            NewsSentiment(
-                title=f"{ticker} Market Update",
-                url="",
-                summary=f"Could not retrieve news at this time for {ticker}.",
-                overall_sentiment_label="neutral"
-            )
-        ]
-    
+        raise
+
 async def generate_combined_explanation(ticker: str, financial_results: Dict[str, Any], sentiment_results: List[NewsSentiment]):
     """Generate combined explanation of financial and sentiment analysis"""
     try:
         llm = ChatGroq(
             temperature=0.2,  
-            groq_api_key="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", 
+            groq_api_key="gsk_HwlqnlfpfjiSoVtwTLqZWGdyb3FYN96v2InxK27bN", 
             model_name="deepseek-r1-distill-qwen-32b"
         )
         
